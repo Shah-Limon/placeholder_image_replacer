@@ -211,29 +211,92 @@ def generate_and_upload_image(title, max_retries=3, retry_delay=5):
     logger.error(f"All attempts failed for generating image for '{title}'")
     return None
 
+# Replace the entire extract_front_matter function with this improved version
 def extract_front_matter(content):
-    """Extract front matter from markdown content"""
-    pattern = r'^---\s*(.*?)\s*---\s*'
-    match = re.search(pattern, content, re.DOTALL)
-    if match:
-        front_matter_text = match.group(1)
+    """Extract front matter from markdown content with better error handling"""
+    print(f"  ↳ Attempting to extract front matter...")
+    logger.info(f"Attempting to extract front matter")
+    
+    # Print first few characters of content for debugging
+    content_preview = content[:100].replace('\n', '\\n')
+    logger.debug(f"Content preview: {content_preview}...")
+    
+    # Check if content starts with --- which indicates front matter
+    if not content.startswith('---'):
+        print(f"  ↳ Content does not start with '---', no valid front matter")
+        logger.error("Content does not start with '---', no valid front matter")
+        return None, None
+    
+    # Find the second --- that closes the front matter block
+    try:
+        # Find the second occurrence of ---
+        first_marker_end = content.find('---', 0) + 3
+        second_marker_start = content.find('---', first_marker_end)
+        
+        if second_marker_start == -1:
+            print(f"  ↳ Could not find closing '---' for front matter")
+            logger.error("Could not find closing '---' for front matter")
+            return None, None
+        
+        # Extract the text between the markers
+        front_matter_text = content[first_marker_end:second_marker_start].strip()
+        full_front_matter = content[:second_marker_start+3]
+        
         try:
             front_matter = yaml.safe_load(front_matter_text)
-            return front_matter, match.group(0)
+            if front_matter and isinstance(front_matter, dict):
+                # Explicitly check for title
+                if 'title' in front_matter:
+                    print(f"  ↳ Successfully extracted front matter with title: '{front_matter['title']}'")
+                    logger.info(f"Successfully extracted front matter with title: '{front_matter['title']}'")
+                else:
+                    print(f"  ↳ Front matter found but no 'title' field: {list(front_matter.keys())}")
+                    logger.warning(f"Front matter found but no 'title' field. Available keys: {list(front_matter.keys())}")
+                
+                return front_matter, full_front_matter
+            else:
+                print(f"  ↳ Front matter parsed but returned {type(front_matter)} instead of a dictionary")
+                logger.error(f"Front matter parsed but returned {type(front_matter)} instead of a dictionary")
         except yaml.YAMLError as e:
-            logger.error(f"Error parsing front matter: {e}")
-            print(f"  ↳ Error parsing front matter: {e}")
+            print(f"  ↳ YAML parsing error: {e}")
+            logger.error(f"YAML parsing error: {e}")
+            print(f"  ↳ Front matter text: {front_matter_text[:100]}...")
+            logger.error(f"Front matter text: {front_matter_text[:100]}...")
+    except Exception as e:
+        print(f"  ↳ Unexpected error extracting front matter: {e}")
+        logger.error(f"Unexpected error extracting front matter: {e}")
+    
     return None, None
 
+# Also update the replace_image_in_markdown function to add more debugging info
 def replace_image_in_markdown(md_file_path):
-    """Check and replace placeholder image in markdown file"""
+    """Check and replace placeholder image in markdown file with improved error handling"""
     try:
         file_basename = os.path.basename(md_file_path)
         print(f"\n📄 Processing file: {file_basename}")
         logger.info(f"Processing file: {md_file_path}")
         
-        with open(md_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # Check if file exists and is readable
+        if not os.path.exists(md_file_path):
+            print(f"  ↳ ❌ File does not exist: {md_file_path}")
+            logger.error(f"File does not exist: {md_file_path}")
+            stats["failed_replacements"] += 1
+            return False
+            
+        # Read the file with explicit UTF-8 encoding
+        try:
+            with open(md_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                content_length = len(content)
+                print(f"  ↳ Successfully read file ({content_length} bytes)")
+                logger.info(f"Successfully read file ({content_length} bytes)")
+        except UnicodeDecodeError:
+            # Try with a different encoding if UTF-8 fails
+            with open(md_file_path, 'r', encoding='latin-1') as f:
+                content = f.read()
+                content_length = len(content)
+                print(f"  ↳ Read file with latin-1 encoding ({content_length} bytes)")
+                logger.info(f"Read file with latin-1 encoding ({content_length} bytes)")
         
         # Check if placeholder image exists in content
         if PLACEHOLDER_IMAGE_URL not in content:
@@ -245,14 +308,23 @@ def replace_image_in_markdown(md_file_path):
         stats["files_with_placeholders"] += 1
         
         # Extract front matter to get title
-        front_matter, _ = extract_front_matter(content)
+        front_matter, front_matter_text = extract_front_matter(content)
         if not front_matter or 'title' not in front_matter:
             print(f"  ↳ Could not extract title from file")
             logger.error(f"Could not extract title from {md_file_path}")
-            stats["failed_replacements"] += 1
-            return False
-        
-        title = front_matter['title']
+            
+            # Additional debugging - try to find title directly with regex
+            title_match = re.search(r'^title:\s*(.+?)$', content, re.MULTILINE)
+            if title_match:
+                extracted_title = title_match.group(1).strip()
+                print(f"  ↳ Alternative title extraction found: '{extracted_title}'")
+                logger.info(f"Alternative title extraction found: '{extracted_title}'")
+                title = extracted_title
+            else:
+                stats["failed_replacements"] += 1
+                return False
+        else:
+            title = front_matter['title']
         
         # Generate and upload new image with retries
         new_image_url = generate_and_upload_image(title, max_retries=MAX_RETRIES, retry_delay=BASE_RETRY_DELAY)
@@ -295,7 +367,6 @@ def replace_image_in_markdown(md_file_path):
         stats["failed_replacements"] += 1
         # Propagate the exception for rate limit handling
         raise
-
 def process_all_markdown_files():
     """Process all markdown files in the generated articles directory with rate limit handling"""
     # Get all markdown files
