@@ -137,37 +137,11 @@ def generate_and_upload_image(title, max_retries=3, retry_delay=5):
                 config=types.GenerateContentConfig(response_modalities=["image", "text"])
             )
 
-            if (response.candidates and response.candidates[0].content.parts and 
-                len(response.candidates[0].content.parts) > 0):
+            if response.candidates and response.candidates[0].content.parts:
+                print(f"  ↳ Image received from API")
+                logger.info(f"Successfully received image from Gemini API")
                 
-                print(f"  ↳ Received response with {len(response.candidates[0].content.parts)} parts")
-                logger.info(f"Received response with {len(response.candidates[0].content.parts)} parts")
-                
-                # Get the first part and verify it has inline_data
-                first_part = response.candidates[0].content.parts[0]
-                
-                if not hasattr(first_part, 'inline_data') or first_part.inline_data is None:
-                    print(f"  ↳ Response does not contain image data")
-                    logger.error(f"Response part does not contain inline_data attribute")
-                    raise Exception("Response does not contain valid image data")
-                
-                inline_data = first_part.inline_data
-                
-                # Verify mime_type exists
-                if not hasattr(inline_data, 'mime_type') or inline_data.mime_type is None:
-                    print(f"  ↳ Response inline_data does not have mime_type")
-                    logger.error(f"Response inline_data does not have mime_type attribute")
-                    raise Exception("Response inline_data missing mime_type")
-                
-                # Verify data exists
-                if not hasattr(inline_data, 'data') or inline_data.data is None:
-                    print(f"  ↳ Response inline_data does not have data")
-                    logger.error(f"Response inline_data does not have data attribute")
-                    raise Exception("Response inline_data missing data")
-                
-                print(f"  ↳ Image received from API (mime_type: {inline_data.mime_type})")
-                logger.info(f"Successfully received image from Gemini API (mime_type: {inline_data.mime_type})")
-                
+                inline_data = response.candidates[0].content.parts[0].inline_data
                 file_ext = mimetypes.guess_extension(inline_data.mime_type)
                 original_file = f"generated_image_{int(time.time())}{file_ext}"
                 save_binary_file(original_file, inline_data.data)
@@ -206,9 +180,6 @@ def generate_and_upload_image(title, max_retries=3, retry_delay=5):
                 if image_url:
                     print(f"  ↳ ✅ Image successfully generated and uploaded")
                     return image_url
-            else:
-                print(f"  ↳ Response did not contain any valid parts")
-                logger.error(f"Response did not contain any valid parts")
             
             # If we got here, something failed but didn't raise an exception
             # Wait with exponential backoff before retrying
