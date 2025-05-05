@@ -1,22 +1,19 @@
-name: Generate Articles
+name: Replace Placeholder Images
 
 on:
   schedule:
     # Run every 4 hours
-    - cron: '0 */4 * * *'
+    - cron: '0 */2 * * *'
   workflow_dispatch:  # Allow manual triggering
 
 jobs:
-  generate-articles:
+  replace-images:
     runs-on: ubuntu-latest
     
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      CLOUDINARY_URL: ${{ secrets.CLOUDINARY_URL }}
       CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
       CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
-      CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
-      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
       
     steps:
       - name: Checkout repository
@@ -30,21 +27,41 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install google-genai pillow requests markdown pyyaml numpy scikit-learn nltk
+          pip install google-genai pillow requests pyyaml
           
       - name: Replace Placeholder Images
-        run: python .github/scripts/placeholder_image_replacer.py
+        id: replace_images
+        run: |
+          echo "::group::Starting Image Replacement Process"
+          echo "🔍 Scanning for placeholder images in markdown files..."
+          echo "::endgroup::"
+          
+          # Run the image replacement script with verbose output
+          python .github/scripts/placeholder_image_replacer.py --verbose
+          
+          # Create a summary of replaced images
+          echo "::group::Image Replacement Summary"
+          echo "✅ Process completed"
+          if [ -f "image_replacement_summary.txt" ]; then
+            cat image_replacement_summary.txt
+          fi
+          echo "::endgroup::"
         env:
           CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
           CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         
-      - name: Commit generated articles and data files
+      - name: Upload Image Replacement Summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: image-replacement-summary
+          path: image_replacement_summary.txt
+          if-no-files-found: ignore
+          
+      - name: Commit updated articles
         run: |
           git config --global user.name 'GitHub Actions Bot'
           git config --global user.email 'actions@github.com'
           git add generated-articles/
-          git add data/
-          git add .last_keyword_index
-          git commit -m "Auto-generate articles and update tracking data [skip ci]" || echo "No changes to commit"
+          git commit -m "Replace placeholder images with generated images [skip ci]" || echo "No changes to commit"
           git push
