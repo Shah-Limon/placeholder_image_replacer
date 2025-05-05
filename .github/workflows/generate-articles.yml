@@ -52,11 +52,11 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         
       - name: Upload Image Replacement Summary
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: image-replacement-summary
           path: image_replacement_summary.txt
-          if-no-files-found: ignore
+          if-no-files-found: warn
           
       - name: Commit updated articles
         run: |
