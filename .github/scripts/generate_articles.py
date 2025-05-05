@@ -1,591 +1,533 @@
 #!/usr/bin/env python3
-# .github/scripts/generate_articles.py
+# .github/scripts/placeholder_image_replacer.py
 
-import base64
 import os
-import json
+import re
 import time
 import requests
-import markdown
-import mimetypes
 import yaml
-import re
-import smtplib
-import random
-import csv
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
-from datetime import datetime, timedelta
+import argparse
 from PIL import Image
 from google import genai
 from google.genai import types
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
+import mimetypes
+import glob
+import logging
+from datetime import datetime
+import sys
 
-# Configure output directory
-OUTPUT_DIR = "generated-articles"
-KEYWORDS_FILE = "data/keywords.txt"
-PROCESSED_KEYWORDS_FILE = "data/processed_keywords.txt"
-GENERATED_KEYWORDS_FILE = "data/keywords-generated.txt"  # New file for successfully generated keywords
-LINKS_FILE = "data/links.txt"  # New file for tracking links
-ARTICLES_PER_RUN = 28
-TOP_LINKS_COUNT = 70  # Number of top relevant links to include
+# Setup argument parser
+parser = argparse.ArgumentParser(description='Replace placeholder images in markdown files')
+parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+args = parser.parse_args()
 
-# Ensure output directories exist
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(os.path.dirname(PROCESSED_KEYWORDS_FILE), exist_ok=True)
-os.makedirs(os.path.dirname(GENERATED_KEYWORDS_FILE), exist_ok=True)
-os.makedirs(os.path.dirname(LINKS_FILE), exist_ok=True)
+# Configure logging
+log_level = logging.INFO if args.verbose else logging.WARNING
+logging.basicConfig(
+    level=log_level,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-# Download NLTK data if needed
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('stopwords')
+# Constants
+PLACEHOLDER_IMAGE_URL = "https://res.cloudinary.com/dbcpfy04c/image/upload/v1743184673/images_k6zam3.png"
+GENERATED_ARTICLES_DIR = "generated-articles"
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SUMMARY_FILE = "image_replacement_summary.txt"
+
+# Rate limit configuration
+MAX_RETRIES = 5        # Maximum number of retries for API calls
+BASE_RETRY_DELAY = 5   # Base delay in seconds before retrying
+MAX_DELAY = 120        # Maximum delay in seconds
+SUCCESS_DELAY = 60     # Wait 1 minute (60 seconds) after successful image creation
+
+# Summary statistics
+stats = {
+    "total_files": 0,
+    "files_with_placeholders": 0,
+    "successful_replacements": 0,
+    "failed_replacements": 0,
+    "skipped_files": 0,
+    "replaced_images": []
+}
 
 def save_binary_file(file_name, data):
+    """Save binary data to a file"""
     with open(file_name, "wb") as f:
         f.write(data)
+    logger.info(f"Saved binary data to {file_name}")
 
 def compress_image(image_path, quality=85):
+    """Compress and convert image to WebP format"""
     try:
         with Image.open(image_path) as img:
             webp_path = f"{os.path.splitext(image_path)[0]}.webp"
             img.save(webp_path, 'WEBP', quality=quality)
             os.remove(image_path)  # Remove original file
+            logger.info(f"Compressed image and saved as {webp_path}")
             return webp_path
     except Exception as e:
-        print(f"Image compression error: {e}")
+        logger.error(f"Image compression error: {e}")
         return image_path
 
 def upload_to_cloudinary(file_path, resource_type="image"):
-    """Upload file to Cloudinary. resource_type can be 'image', 'raw', etc."""
-    url = f"https://api.cloudinary.com/v1_1/{os.environ['CLOUDINARY_CLOUD_NAME']}/{resource_type}/upload"
+    """Upload file to Cloudinary
+    
+    Raises appropriate exceptions on rate limit or other errors
+    for proper handling by the calling function
+    """
+    logger.info(f"Uploading {file_path} to Cloudinary...")
+    url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/{resource_type}/upload"
     payload = {
         'upload_preset': 'ml_default',
-        'api_key': os.environ['CLOUDINARY_API_KEY']
+        'api_key': CLOUDINARY_API_KEY
     }
-    try:
-        with open(file_path, 'rb') as f:
-            files = {'file': f}
-            response = requests.post(url, data=payload, files=files)
-        if response.status_code == 200:
-            return response.json()['secure_url']
-        print(f"Upload failed: {response.text}")
-        return None
-    except Exception as e:
-        print(f"Upload error: {e}")
-        return None
-
-def generate_and_upload_image(title):
-    try:
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        model = "gemini-2.0-flash-exp-image-generation"
-        contents = [types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=f"Create a realistic blog header image for: {title}")]
-        )]
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(response_modalities=["image", "text"])
-        )
-
-        if response.candidates and response.candidates[0].content.parts:
-            inline_data = response.candidates[0].content.parts[0].inline_data
-            file_ext = mimetypes.guess_extension(inline_data.mime_type)
-            original_file = f"generated_image_{int(time.time())}{file_ext}"
-            save_binary_file(original_file, inline_data.data)
-
-            # Compress and convert to WebP
-            final_file = compress_image(original_file)
-            return upload_to_cloudinary(final_file)
-        return None
-    except Exception as e:
-        print(f"Image generation error: {e}")
-        return None
-
-def create_slug(title):
-    """Generate SEO-friendly slug from title"""
-    slug = title.lower()
-    # Remove special characters and replace spaces with hyphens
-    slug = re.sub(r'[^a-z0-9\s-]', '', slug)
-    slug = re.sub(r'[\s-]+', '-', slug)
-    slug = slug.strip('-')  # Remove leading/trailing hyphens
-    slug = slug[:100]  # Limit length
-    return slug
-
-def link_to_keywords(link):
-    """Convert a link to plain text keywords"""
-    # Extract path from URL
-    url_path = link.split('beacleaner.com/')[-1].strip('/')
-    # Convert hyphens to spaces and remove trailing slash
-    keywords = url_path.replace('-', ' ')
-    return keywords
-
-def find_relevant_links(target_keyword, links, top_n=TOP_LINKS_COUNT):
-    """Find the most relevant links for a given keyword using cosine similarity"""
-    if not links:
-        return []
     
-    # Convert links to plain text keywords
-    link_keywords = [link_to_keywords(link) for link in links]
+    with open(file_path, 'rb') as f:
+        files = {'file': f}
+        response = requests.post(url, data=payload, files=files)
     
-    # Add the target keyword to the list of texts
-    all_texts = link_keywords + [target_keyword]
+    if response.status_code == 200:
+        image_url = response.json()['secure_url']
+        logger.info(f"✅ Successfully uploaded to Cloudinary: {image_url}")
+        return image_url
+    elif response.status_code == 429:
+        # Rate limit error
+        logger.warning(f"⚠️ Cloudinary rate limit exceeded: {response.text}")
+        raise Exception(f"Cloudinary rate limit exceeded: {response.text}")
+    elif response.status_code >= 500:
+        # Server error
+        logger.error(f"❌ Cloudinary server error: {response.text}")
+        raise Exception(f"Cloudinary server error: {response.text}")
+    else:
+        # Other error
+        logger.error(f"❌ Cloudinary upload failed with status {response.status_code}: {response.text}")
+        raise Exception(f"Cloudinary upload failed with status {response.status_code}: {response.text}")
+
+def generate_and_upload_image(title, max_retries=3, retry_delay=5):
+    """Generate an image with Gemini API and upload to Cloudinary
     
-    # Create TF-IDF vectors
-    vectorizer = TfidfVectorizer(stop_words='english')
-    tfidf_matrix = vectorizer.fit_transform(all_texts)
+    Args:
+        title: The article title to generate an image for
+        max_retries: Maximum number of retries for API calls (default: 3)
+        retry_delay: Initial delay between retries in seconds (default: 5)
+    """
+    print(f"\n🎨 Generating image for: '{title}'")
+    logger.info(f"Starting image generation process for: {title}")
     
-    # Calculate cosine similarity between the target keyword and all link keywords
-    target_vector = tfidf_matrix[-1]  # Last vector is the target keyword
-    link_vectors = tfidf_matrix[:-1]  # All other vectors are link keywords
-    similarities = cosine_similarity(target_vector, link_vectors).flatten()
-    
-    # Sort links by similarity score
-    link_sim_pairs = list(zip(links, similarities))
-    link_sim_pairs.sort(key=lambda x: x[1], reverse=True)
-    
-    # Return top N most similar links
-    top_links = [pair[0] for pair in link_sim_pairs[:top_n]]
-    
-    print(f"Found {len(top_links)} relevant links for keyword: {target_keyword}")
-    for i, (link, sim) in enumerate(link_sim_pairs[:5], 1):
-        print(f"  {i}. {link} (similarity: {sim:.4f})")
-    
-    return top_links
-
-def create_article_prompt(title, article_number, image_url):
-    tomorrow = datetime.now() + timedelta(days=1)
-    publish_date = tomorrow.strftime("%Y-%m-%d")
-    slug = create_slug(title)
-    canonical_url = f"https://www.beacleaner.com/{slug}"
-    
-    # Get existing links from links.txt
-    existing_links = get_existing_links()
-    
-    # Find relevant links using cosine similarity
-    relevant_links = find_relevant_links(title, existing_links)
-    
-    # Format links as a JSON string for the prompt
-    links_json = json.dumps(relevant_links, indent=2)
-
-    prompt = f"""Based on the title: "{title}", create a comprehensive, SEO-optimized article:
-
-This will be article #{article_number} in the series.
-
-Create a comprehensive, SEO-optimized article in Markdown format, approximately 2,500–3,000 words in length, following the provided guidelines.
-
----
-publishDate: {publish_date}T00:00:00Z
-title: {title}  # Use the exact user-entered title here
-excerpt: [Write compelling meta description between 130-145 characters that includes primary keyword]
-image: {image_url}
-category: [Determine appropriate category based on content]
-tags:
-  - [related keyword]
-  - [secondary keyword]
-  - [related keyword]
-metadata:
-  canonical: {canonical_url}
----
-
-Article Structure Requirements:
-1. Title (H2): Include primary keyword near beginning, under 60 characters, compelling and click-worthy
-2. Introduction (150-200 words): Open with hook, include primary keyword in first 100 words, establish relevance, outline article content
-3. Takeaway: Brief summary of key actionable message in the bullet points
-4. Provide a clear, concise answer to the main query in 40-60 words.
-5. Main Body: 5-7+ H2 sections with:
-   - Section headings using keywords naturally
-   - 200-300 words per section
-   - Include primary/secondary keywords
-   - Use H3 subsections where appropriate
-   - Include bullet points or numbered lists
-   - Include 3-7 anchor texts links that are contextually relevant to the current content. Choose from these most relevant links based on cosine similarity:
-   {links_json}
-   - Natural transitions between sections
-6. FAQ Section: 4-6 questions based on common search queries, with concise answers (50-75 words each)
-7. Conclusion (150-200 words): Summarize main points, restate primary keyword, include clear call-to-action
-
-Ensure the article:
-- Uses semantic analysis and NLP techniques for natural keyword inclusion
-- Has high readability with varied sentence structures
-- Incorporates LSI keywords naturally
-- Has proper hierarchy with H2 and H3 tags
-- Uses engaging, conversational tone
-- Provides unique, valuable insights
-- Create content strictly adhering to an NLP-friendly format, emphasizing clarity and simplicity in structure and language. Ensure sentences follow a straightforward subject-verb-object order, selecting words for their precision and avoiding any ambiguity. Exclude filler content, focusing on delivering information succinctly. Do not use complex or abstract terms such as 'meticulous', 'navigating', 'complexities,' 'realm,' 'bespoke,' 'tailored', 'towards,' 'underpins,' 'ever-changing,' 'the world of,' 'not only,' 'seeking more than just,' 'ever-evolving,' 'robust'. This approach aims to streamline content production for enhanced NLP algorithm comprehension, ensuring the output is direct, accessible, and interpretable.
-- While prioritizing NLP-friendly content creation (60%), also dedicate 40% of your focus to making the content engaging and enjoyable for readers, balancing technical NLP-optimization with reader satisfaction to produce content that not only ranks well on search engines but also remains compelling and valuable to the audience.
-- Write content on [Keyword] in a conversational tone. Explain each idea within three to four sentences. Ensure each sentence is simple, sweet, and to-the-point. Use first-person perspective where appropriate to add a personal touch. Be creative with the starting sentence and bring variations. Ensure you include an intro and a conclusion. Make sure all ideas are fresh, unique, and new.
-
-When inserting links, choose 3-4 that are most contextually relevant to the specific section content. Format the links as proper Markdown anchor text, like this: [anchor text](URL).
-
-Provide the complete article in proper Markdown format.
-"""
-    return prompt
-
-def generate_article(prompt):
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-    model = "gemma-3-27b-it"
-    contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
-    generate_content_config = types.GenerateContentConfig(
-        temperature=1,
-        top_p=0.95,
-        top_k=64,
-        max_output_tokens=8192,
-        response_mime_type="text/plain",
-    )
-    
-    try:
-        print(f"Generating article...")
-        full_response = ""
-        
-        # Using streaming response
-        for chunk in client.models.generate_content_stream(
-            model=model,
-            contents=contents,
-            config=generate_content_config,
-        ):
-            if chunk.text:
-                print(chunk.text, end="", flush=True)
-                full_response += chunk.text
-        
-        print("\nArticle generation complete.")
-        return full_response if full_response else "No content generated"
-    except Exception as e:
-        print(f"Error generating article: {e}")
-        return f"Error generating article: {e}"
-
-def send_email_notification(titles, article_urls, recipient_email="beacleaner0@gmail.com"):
-    """Send email notification about generated articles"""
-    from_email = "limon.working@gmail.com"
-    app_password = os.environ.get("EMAIL_PASSWORD")
-    
-    if not app_password:
-        print("Email password not set. Skipping email notification.")
-        return False
-
-    # Create the email
-    msg = MIMEMultipart()
-    msg['From'] = from_email
-    msg['To'] = recipient_email
-    msg['Subject'] = f"Generated Articles - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-
-    # Add body text
-    body = f"The following articles have been generated and committed to the GitHub repository:\n\n"
-    for i, (title, url) in enumerate(zip(titles, article_urls), 1):
-        body += f"{i}. {title}\n   URL: {url}\n\n"
-    
-    msg.attach(MIMEText(body, 'plain'))
-
-    # Send the email
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(from_email, app_password)
-        server.send_message(msg)
-        server.quit()
-        print(f"Email notification sent successfully to {recipient_email}")
-        return True
-    except Exception as e:
-        print(f"Failed to send email notification: {e}")
-        return False
-
-def read_keywords_from_csv(filename=KEYWORDS_FILE):
-    """Read all keywords from the CSV file"""
-    try:
-        keywords = []
-        if os.path.exists(filename):
-            with open(filename, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if row and row[0].strip():  # Check if row exists and has content
-                        keywords.append(row[0].strip())
-        else:
-            print(f"Keywords file {filename} not found. Creating new file.")
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
-            with open(filename, 'w', encoding='utf-8'):
-                pass
-        return keywords
-    except Exception as e:
-        print(f"Error reading keywords from CSV: {e}")
-        return []
-
-def write_keywords_to_csv(keywords, filename=KEYWORDS_FILE):
-    """Write keywords back to the CSV file"""
-    try:
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        with open(filename, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            for keyword in keywords:
-                writer.writerow([keyword])
-        return True
-    except Exception as e:
-        print(f"Error writing keywords to CSV: {e}")
-        return False
-
-def append_processed_keywords(keywords, urls, filename=PROCESSED_KEYWORDS_FILE):
-    """Append processed keywords to the processed file with timestamps and URLs"""
-    try:
-        # Create file if it doesn't exist
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        
-        # Determine header based on file existence
-        file_exists = os.path.exists(filename) and os.path.getsize(filename) > 0
-        
-        with open(filename, 'a', encoding='utf-8') as f:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"  ↳ Attempt {attempt}/{max_retries} using Gemini API")
+            logger.info(f"Image generation attempt {attempt}/{max_retries}")
             
-            # Write header if it's a new file
-            if not file_exists:
-                f.write("# Processed Keywords Log\n")
-                f.write("# Format: [TIMESTAMP] KEYWORD - URL\n\n")
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            model = "gemini-2.0-flash-exp-image-generation"
+            contents = [types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=f"Create a realistic blog header image for: {title}")]
+            )]
             
-            f.write(f"## Batch processed on {timestamp}\n")
-            for keyword, url in zip(keywords, urls):
-                f.write(f"[{url}\n")
-            f.write("\n")  # Add a blank line between batches
-        return True
-    except Exception as e:
-        print(f"Error appending to processed keywords file: {e}")
-        return False
+            print(f"  ↳ Requesting image from Gemini API...")
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(response_modalities=["image", "text"])
+            )
 
-def append_to_generated_keywords(keywords, filename=GENERATED_KEYWORDS_FILE):
-    """Append successfully generated keywords to the keywords-generated.txt file"""
-    try:
-        # Create file if it doesn't exist
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        
-        with open(filename, 'a', encoding='utf-8') as f:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for keyword in keywords:
-                f.write(f"{keyword}\n")
-        return True
-    except Exception as e:
-        print(f"Error appending to generated keywords file: {e}")
-        return False
+            if (response.candidates and response.candidates[0].content.parts and 
+                len(response.candidates[0].content.parts) > 0):
+                
+                print(f"  ↳ Received response with {len(response.candidates[0].content.parts)} parts")
+                logger.info(f"Received response with {len(response.candidates[0].content.parts)} parts")
+                
+                # Get the first part and verify it has inline_data
+                first_part = response.candidates[0].content.parts[0]
+                
+                if not hasattr(first_part, 'inline_data') or first_part.inline_data is None:
+                    print(f"  ↳ Response does not contain image data")
+                    logger.error(f"Response part does not contain inline_data attribute")
+                    raise Exception("Response does not contain valid image data")
+                
+                inline_data = first_part.inline_data
+                
+                # Verify mime_type exists
+                if not hasattr(inline_data, 'mime_type') or inline_data.mime_type is None:
+                    print(f"  ↳ Response inline_data does not have mime_type")
+                    logger.error(f"Response inline_data does not have mime_type attribute")
+                    raise Exception("Response inline_data missing mime_type")
+                
+                # Verify data exists
+                if not hasattr(inline_data, 'data') or inline_data.data is None:
+                    print(f"  ↳ Response inline_data does not have data")
+                    logger.error(f"Response inline_data does not have data attribute")
+                    raise Exception("Response inline_data missing data")
+                
+                print(f"  ↳ Image received from API (mime_type: {inline_data.mime_type})")
+                logger.info(f"Successfully received image from Gemini API (mime_type: {inline_data.mime_type})")
+                
+                file_ext = mimetypes.guess_extension(inline_data.mime_type)
+                original_file = f"generated_image_{int(time.time())}{file_ext}"
+                save_binary_file(original_file, inline_data.data)
 
-def append_to_links_file(old_urls, new_urls, filename=LINKS_FILE):
-    """Append both old and new links to the links.txt file, removing duplicates"""
+                # Compress and convert to WebP
+                print(f"  ↳ Compressing image...")
+                final_file = compress_image(original_file)
+                
+                # Upload to Cloudinary with retries
+                image_url = None
+                for upload_attempt in range(1, max_retries + 1):
+                    try:
+                        print(f"  ↳ Uploading to Cloudinary (attempt {upload_attempt}/{max_retries})...")
+                        logger.info(f"Upload attempt {upload_attempt}/{max_retries}")
+                        image_url = upload_to_cloudinary(final_file)
+                        if image_url:
+                            break
+                        current_delay = retry_delay * (2 ** (upload_attempt - 1))  # Exponential backoff
+                        print(f"  ↳ Upload failed, retrying in {current_delay}s...")
+                        logger.warning(f"Upload failed, retrying in {current_delay} seconds")
+                        time.sleep(current_delay)
+                    except Exception as e:
+                        print(f"  ↳ Upload error: {e}")
+                        logger.error(f"Upload error (attempt {upload_attempt}/{max_retries}): {e}")
+                        if "rate limit" in str(e).lower():
+                            current_delay = retry_delay * (2 ** (upload_attempt - 1))  # Exponential backoff
+                            print(f"  ↳ Rate limit hit, waiting {current_delay}s before retry...")
+                            logger.warning(f"Rate limit hit, waiting {current_delay} seconds before retry")
+                            time.sleep(current_delay)
+                
+                # Clean up local file
+                if os.path.exists(final_file):
+                    os.remove(final_file)
+                    logger.info(f"Removed temporary file {final_file}")
+                
+                if image_url:
+                    print(f"  ↳ ✅ Image successfully generated and uploaded")
+                    return image_url
+            else:
+                print(f"  ↳ Response did not contain any valid parts")
+                logger.error(f"Response did not contain any valid parts")
+            
+            # If we got here, something failed but didn't raise an exception
+            # Wait with exponential backoff before retrying
+            if attempt < max_retries:
+                current_delay = retry_delay * (2 ** (attempt - 1))
+                print(f"  ↳ Generation failed, retrying in {current_delay}s...")
+                logger.warning(f"Generation failed, retrying in {current_delay} seconds")
+                time.sleep(current_delay)
+            
+        except Exception as e:
+            error_message = str(e).lower()
+            print(f"  ↳ ❌ Error: {e}")
+            logger.error(f"Image generation error (attempt {attempt}/{max_retries}): {e}")
+            
+            # Check for rate limit errors
+            if "rate limit" in error_message or "quota" in error_message or "429" in error_message:
+                if attempt < max_retries:
+                    current_delay = retry_delay * (2 ** attempt)  # Longer exponential backoff for rate limits
+                    print(f"  ↳ API rate limit hit, waiting {current_delay}s before retry...")
+                    logger.warning(f"API rate limit hit, waiting {current_delay} seconds before retry")
+                    time.sleep(current_delay)
+            elif attempt < max_retries:
+                current_delay = retry_delay * (2 ** (attempt - 1))
+                print(f"  ↳ Error occurred, retrying in {current_delay}s...")
+                logger.warning(f"Error occurred, retrying in {current_delay} seconds")
+                time.sleep(current_delay)
+    
+    print(f"  ↳ ❌ All attempts failed for generating image for '{title}'")
+    logger.error(f"All attempts failed for generating image for '{title}'")
+    return None
+
+# Replace the entire extract_front_matter function with this improved version
+def extract_front_matter(content):
+    """Extract front matter from markdown content with better error handling"""
+    print(f"  ↳ Attempting to extract front matter...")
+    logger.info(f"Attempting to extract front matter")
+    
+    # Print first few characters of content for debugging
+    content_preview = content[:100].replace('\n', '\\n')
+    logger.debug(f"Content preview: {content_preview}...")
+    
+    # Check if content starts with --- which indicates front matter
+    if not content.startswith('---'):
+        print(f"  ↳ Content does not start with '---', no valid front matter")
+        logger.error("Content does not start with '---', no valid front matter")
+        return None, None
+    
+    # Find the second --- that closes the front matter block
     try:
-        # Create file if it doesn't exist
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        # Find the second occurrence of ---
+        first_marker_end = content.find('---', 0) + 3
+        second_marker_start = content.find('---', first_marker_end)
         
-        # Get existing links from file to check for duplicates
-        existing_links = set()
-        if os.path.exists(filename) and os.path.getsize(filename) > 0:
-            with open(filename, 'r', encoding='utf-8') as f:
-                existing_links = {line.strip() for line in f if line.strip()}
+        if second_marker_start == -1:
+            print(f"  ↳ Could not find closing '---' for front matter")
+            logger.error("Could not find closing '---' for front matter")
+            return None, None
         
-        # Combine and deduplicate links
-        all_urls = old_urls + new_urls
-        unique_new_urls = [url for url in all_urls if url not in existing_links]
+        # Extract the text between the markers
+        front_matter_text = content[first_marker_end:second_marker_start].strip()
+        full_front_matter = content[:second_marker_start+3]
         
-        # Only write if there are new unique URLs
-        if unique_new_urls:
-            with open(filename, 'a', encoding='utf-8') as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                # Write only unique URLs
-                for url in unique_new_urls:
-                    f.write(f"{url}\n")
-                f.write("\n")  # Add a blank line between batches
-            return True
+        try:
+            front_matter = yaml.safe_load(front_matter_text)
+            if front_matter and isinstance(front_matter, dict):
+                # Explicitly check for title
+                if 'title' in front_matter:
+                    print(f"  ↳ Successfully extracted front matter with title: '{front_matter['title']}'")
+                    logger.info(f"Successfully extracted front matter with title: '{front_matter['title']}'")
+                else:
+                    print(f"  ↳ Front matter found but no 'title' field: {list(front_matter.keys())}")
+                    logger.warning(f"Front matter found but no 'title' field. Available keys: {list(front_matter.keys())}")
+                
+                return front_matter, full_front_matter
+            else:
+                print(f"  ↳ Front matter parsed but returned {type(front_matter)} instead of a dictionary")
+                logger.error(f"Front matter parsed but returned {type(front_matter)} instead of a dictionary")
+        except yaml.YAMLError as e:
+            print(f"  ↳ YAML parsing error: {e}")
+            logger.error(f"YAML parsing error: {e}")
+            print(f"  ↳ Front matter text: {front_matter_text[:100]}...")
+            logger.error(f"Front matter text: {front_matter_text[:100]}...")
+    except Exception as e:
+        print(f"  ↳ Unexpected error extracting front matter: {e}")
+        logger.error(f"Unexpected error extracting front matter: {e}")
+    
+    return None, None
+
+# Also update the replace_image_in_markdown function to add more debugging info
+def replace_image_in_markdown(md_file_path):
+    """Check and replace placeholder image in markdown file with improved error handling"""
+    try:
+        file_basename = os.path.basename(md_file_path)
+        print(f"\n📄 Processing file: {file_basename}")
+        logger.info(f"Processing file: {md_file_path}")
+        
+        # Check if file exists and is readable
+        if not os.path.exists(md_file_path):
+            print(f"  ↳ ❌ File does not exist: {md_file_path}")
+            logger.error(f"File does not exist: {md_file_path}")
+            stats["failed_replacements"] += 1
+            return False
+            
+        # Read the file with explicit UTF-8 encoding
+        try:
+            with open(md_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                content_length = len(content)
+                print(f"  ↳ Successfully read file ({content_length} bytes)")
+                logger.info(f"Successfully read file ({content_length} bytes)")
+        except UnicodeDecodeError:
+            # Try with a different encoding if UTF-8 fails
+            with open(md_file_path, 'r', encoding='latin-1') as f:
+                content = f.read()
+                content_length = len(content)
+                print(f"  ↳ Read file with latin-1 encoding ({content_length} bytes)")
+                logger.info(f"Read file with latin-1 encoding ({content_length} bytes)")
+        
+        # Check if placeholder image exists in content
+        if PLACEHOLDER_IMAGE_URL not in content:
+            print(f"  ↳ No placeholder image found")
+            logger.info(f"No placeholder image found in {md_file_path}")
+            stats["skipped_files"] += 1
+            return False
+        
+        stats["files_with_placeholders"] += 1
+        
+        # Extract front matter to get title
+        front_matter, front_matter_text = extract_front_matter(content)
+        if not front_matter or 'title' not in front_matter:
+            print(f"  ↳ Could not extract title from file")
+            logger.error(f"Could not extract title from {md_file_path}")
+            
+            # Additional debugging - try to find title directly with regex
+            title_match = re.search(r'^title:\s*(.+?)$', content, re.MULTILINE)
+            if title_match:
+                extracted_title = title_match.group(1).strip()
+                print(f"  ↳ Alternative title extraction found: '{extracted_title}'")
+                logger.info(f"Alternative title extraction found: '{extracted_title}'")
+                title = extracted_title
+            else:
+                stats["failed_replacements"] += 1
+                return False
         else:
-            print("No new unique URLs to append")
-            return True
+            title = front_matter['title']
+        
+        # Generate and upload new image with retries
+        new_image_url = generate_and_upload_image(title, max_retries=MAX_RETRIES, retry_delay=BASE_RETRY_DELAY)
+        if not new_image_url:
+            print(f"  ↳ Failed to generate image after {MAX_RETRIES} attempts")
+            logger.error(f"Failed to generate image for '{title}' after {MAX_RETRIES} attempts")
+            stats["failed_replacements"] += 1
+            return False
+        
+        # Replace placeholder with new image URL
+        updated_content = content.replace(PLACEHOLDER_IMAGE_URL, new_image_url)
+        
+        # Write updated content back to file
+        with open(md_file_path, 'w', encoding='utf-8') as f:
+            f.write(updated_content)
+        
+        print(f"  ↳ ✅ Successfully replaced placeholder image")
+        print(f"  ↳ New image URL: {new_image_url}")
+        logger.info(f"Successfully replaced placeholder image in {file_basename}")
+        logger.info(f"New image URL: {new_image_url}")
+        
+        # Create a backup of the original file
+        backup_path = f"{md_file_path}.bak"
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        logger.info(f"Backup saved to {backup_path}")
+        
+        stats["successful_replacements"] += 1
+        stats["replaced_images"].append({
+            "file": file_basename,
+            "title": title,
+            "image_url": new_image_url
+        })
+        
+        return True
+    
     except Exception as e:
-        print(f"Error appending to links file: {e}")
-        return False
-
-def get_existing_links(filename=LINKS_FILE):
-    """Get all existing links from links.txt"""
-    existing_links = []
-    if os.path.exists(filename):
-        with open(filename, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and 'https://' in line:
-                    existing_links.append(line)
-    return existing_links
-
-def get_keywords(filename=KEYWORDS_FILE, count=ARTICLES_PER_RUN):
-    """Get keywords from file and track which ones were used"""
-    try:
-        # Read all keywords from CSV
-        all_keywords = read_keywords_from_csv(filename)
-        
-        if not all_keywords:
-            print("No keywords found in the CSV file or file is empty.")
-            # Fallback to default keywords
-            return [
-                " ",
-               
-            ], []
-        
-        # If we don't have enough keywords, use what we have
-        if len(all_keywords) <= count:
-            selected_keywords = all_keywords.copy()
-            return selected_keywords, selected_keywords
-        
-        # Find the most recently processed index from a tracking file
-        last_index = 0
-        track_file = ".last_keyword_index"
-        if os.path.exists(track_file):
-            with open(track_file, 'r') as f:
-                try:
-                    last_index = int(f.read().strip())
-                except ValueError:
-                    last_index = 0
-        
-        # Calculate next batch of keywords
-        start_index = last_index % len(all_keywords)
-        end_index = start_index + count
-        
-        # Handle wrapping around the list
-        if end_index <= len(all_keywords):
-            selected_keywords = all_keywords[start_index:end_index]
-        else:
-            selected_keywords = all_keywords[start_index:] + all_keywords[:end_index - len(all_keywords)]
-        
-        # Update tracking file - always reset to 0
-        with open(track_file, 'w') as f:
-            f.write('0')
-        
-        return selected_keywords, selected_keywords
-        
-    except Exception as e:
-        print(f"Error reading keywords file: {e}")
-        # Fallback to default keywords if we can't read the file
-        return [
-            " "
-        ], []
-
-def update_keyword_files(all_used_keywords, article_urls):
-    """Update the keyword files after processing"""
-    if not all_used_keywords:
-        print("No keywords to update.")
+        print(f"  ↳ ❌ Error: {e}")
+        logger.error(f"Error processing {os.path.basename(md_file_path)}: {e}")
+        stats["failed_replacements"] += 1
+        # Propagate the exception for rate limit handling
+        raise
+def process_all_markdown_files():
+    """Process all markdown files in the generated articles directory with rate limit handling"""
+    # Get all markdown files
+    md_files = glob.glob(os.path.join(GENERATED_ARTICLES_DIR, "*.md"))
+    
+    if not md_files:
+        print(f"⚠️ No markdown files found in {GENERATED_ARTICLES_DIR}")
+        logger.warning(f"No markdown files found in {GENERATED_ARTICLES_DIR}")
         return
     
-    # Read all current keywords
-    all_keywords = read_keywords_from_csv(KEYWORDS_FILE)
+    stats["total_files"] = len(md_files)
+    print(f"🔍 Found {len(md_files)} markdown files to process")
+    logger.info(f"Found {len(md_files)} markdown files to process")
     
-    # Remove used keywords
-    remaining_keywords = [k for k in all_keywords if k not in all_used_keywords]
+    # Base delay between files (will increase if rate limits are hit)
+    base_delay = 3  # seconds
+    current_delay = base_delay
+    max_delay = 60  # Maximum delay in seconds
+    consecutive_failures = 0
+    max_consecutive_failures = 3
     
-    # Write remaining keywords back to Text
-    if write_keywords_to_csv(remaining_keywords, KEYWORDS_FILE):
-        print(f"Removed {len(all_used_keywords)} used keywords from Text file.")
-    else:
-        print("Failed to update CSV file with remaining keywords.")
+    for i, md_file in enumerate(md_files):
+        file_basename = os.path.basename(md_file)
+        print(f"\n📝 File {i+1}/{len(md_files)}: {file_basename}")
+        logger.info(f"Processing ({i+1}/{len(md_files)}): {file_basename}")
+        
+        try:
+            if replace_image_in_markdown(md_file):
+                # Reset delay and failure counter after success
+                consecutive_failures = 0
+                
+                # Wait for 1 minute (60 seconds) after successful image creation
+                print(f"⏱️ Waiting {SUCCESS_DELAY}s before next file...")
+                logger.info(f"Success! Waiting {SUCCESS_DELAY}s before next file as requested")
+                time.sleep(SUCCESS_DELAY)
+                
+                # Reset current delay to base delay for next attempt
+                current_delay = base_delay
+            else:
+                consecutive_failures += 1
+                # Use standard delay between failed files
+                print(f"⏱️ Waiting {current_delay}s before next file...")
+                logger.info(f"Waiting {current_delay}s before next file")
+                time.sleep(current_delay)
+        except Exception as e:
+            consecutive_failures += 1
+            
+            # Check if it's likely a rate limit issue
+            error_message = str(e).lower()
+            if "rate limit" in error_message or "quota" in error_message or "429" in error_message:
+                # Increase delay with rate limit errors
+                current_delay = min(current_delay * 2, max_delay)
+                print(f"⚠️ Rate limit detected. Increasing delay to {current_delay}s")
+                logger.warning(f"Rate limit detected. Increasing delay to {current_delay}s")
+            else:
+                logger.error(f"Error processing {file_basename}: {e}")
+            
+            # Wait before trying next file
+            print(f"⏱️ Waiting {current_delay}s before next file...")
+            logger.info(f"Waiting {current_delay}s before next file")
+            time.sleep(current_delay)
+        
+        # Pause processing if we have too many consecutive failures
+        if consecutive_failures >= max_consecutive_failures:
+            extended_break = min(current_delay * 3, 120)
+            print(f"⚠️ Too many consecutive failures ({consecutive_failures}). Taking a {extended_break}s break...")
+            logger.warning(f"Too many consecutive failures ({consecutive_failures}). Taking a longer break of {extended_break}s")
+            time.sleep(extended_break)  # Extended break
+            consecutive_failures = 0
     
-    # Append used keywords to processed file with URLs
-    if append_processed_keywords(all_used_keywords, article_urls, PROCESSED_KEYWORDS_FILE):
-        print(f"Added {len(all_used_keywords)} keywords to processed keywords file with URLs.")
-    else:
-        print("Failed to update processed keywords file.")
-    
-    # Append successfully generated keywords to keywords-generated.txt
-    if append_to_generated_keywords(all_used_keywords, GENERATED_KEYWORDS_FILE):
-        print(f"Added {len(all_used_keywords)} keywords to generated keywords file.")
-    else:
-        print("Failed to update generated keywords file.")
-    
-    # Get existing links and append new ones to links.txt
-    existing_links = get_existing_links(LINKS_FILE)
-    old_links = [
-        "https://beacleaner.com/how-can-you-use-a-carpet-cleaner-on-hardwood-floor/",
-        "https://beacleaner.com/how-to-clean-luxury-vinyl-plank-flooring/",
-        "https://beacleaner.com/how-to-remove-baking-soda-residue-from-carpet/",
-        "https://beacleaner.com/how-to-clean-floor-grout-without-scrubbing/",
-        "https://beacleaner.com/how-to-remove-old-wax-build-up-from-floors/"
-    ]
-    
-    # Filter out old links that are already in the links file
-    filtered_old_links = [link for link in old_links if link not in existing_links]
-    
-    # Filter out new links that are already in the links file
-    filtered_new_links = [link for link in article_urls if link not in existing_links]
-    
-    if filtered_old_links or filtered_new_links:
-        if append_to_links_file(filtered_old_links, filtered_new_links, LINKS_FILE):
-            print(f"Added {len(filtered_old_links)} old links and {len(filtered_new_links)} new links to links file.")
+    # Create summary file
+    create_summary_file()
+
+def create_summary_file():
+    """Create a summary file of the image replacement process"""
+    with open(SUMMARY_FILE, 'w', encoding='utf-8') as f:
+        f.write("# Image Replacement Summary\n\n")
+        f.write(f"Process completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("## Statistics\n")
+        f.write(f"- Total files scanned: {stats['total_files']}\n")
+        f.write(f"- Files with placeholder images: {stats['files_with_placeholders']}\n")
+        f.write(f"- Successful replacements: {stats['successful_replacements']}\n")
+        f.write(f"- Failed replacements: {stats['failed_replacements']}\n")
+        f.write(f"- Skipped files (no placeholders): {stats['skipped_files']}\n\n")
+        
+        f.write("## Replaced Images\n")
+        if stats["replaced_images"]:
+            for i, item in enumerate(stats["replaced_images"], 1):
+                f.write(f"### {i}. {item['file']}\n")
+                f.write(f"- Title: {item['title']}\n")
+                f.write(f"- Image URL: {item['image_url']}\n")
+                f.write(f"- Preview: ![{item['title']}]({item['image_url']})\n\n")
         else:
-            print("Failed to update links file.")
+            f.write("No images were replaced in this run.\n")
+    
+    logger.info(f"Created summary file: {SUMMARY_FILE}")
+    print(f"\n📋 Created summary file: {SUMMARY_FILE}")
 
 def main():
-    print(f"Starting article generation at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🚀 Starting placeholder image replacement script - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"⚙️ Settings: Max retries: {MAX_RETRIES}, Base delay: {BASE_RETRY_DELAY}s, Success delay: {SUCCESS_DELAY}s")
+    logger.info(f"Starting placeholder image replacement script")
+    logger.info(f"Max retries: {MAX_RETRIES}, Base delay: {BASE_RETRY_DELAY}s, Max delay: {MAX_DELAY}s")
     
-    # Get keywords for this run
-    keywords, keywords_to_track = get_keywords()
-    print(f"Selected {len(keywords)} keywords for processing")
+    # Check environment variables
+    if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, GEMINI_API_KEY]):
+        print("❌ Error: Required environment variables are not set")
+        print(f"CLOUDINARY_CLOUD_NAME: {'✅ Set' if CLOUDINARY_CLOUD_NAME else '❌ Not Set'}")
+        print(f"CLOUDINARY_API_KEY: {'✅ Set' if CLOUDINARY_API_KEY else '❌ Not Set'}")
+        print(f"GEMINI_API_KEY: {'✅ Set' if GEMINI_API_KEY else '❌ Not Set'}")
+        logger.error("Required environment variables are not set")
+        return
     
-    generated_files = []
-    successful_keywords = []
-    article_urls = []
-    default_image_url = "https://res.cloudinary.com/dbcpfy04c/image/upload/v1743184673/images_k6zam3.png"
-
-    for i, title in enumerate(keywords, 1):
-        print(f"\n{'='*50}\nGenerating Article #{i}: {title}\n{'='*50}")
-
-        try:
-            # Generate slug and URL
-            slug = create_slug(title)
-            article_url = f"https://beacleaner.com/{slug}"
-            
-            # Generate image
-            image_url = generate_and_upload_image(title) or default_image_url
-            print(f"Generated image URL: {image_url}")
-
-            # Create prompt with actual image URL
-            prompt = create_article_prompt(title, i, image_url)
-
-            # Generate article
-            article = generate_article(prompt)
-            if article.startswith("Error"):
-                print("Article generation failed, skipping to next keyword")
-                continue
-
-            # Save article
-            filename = f"{OUTPUT_DIR}/{slug}.md"
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(article)
-                
-            generated_files.append(filename)
-            successful_keywords.append(title)
-            article_urls.append(article_url)
-            print(f"Article saved to {filename}")
-            print(f"Article URL: {article_url}")
-
-        except Exception as e:
-            print(f"Error processing keyword '{title}': {e}")
-            continue
-
-        if i < len(keywords):
-            print("Waiting 10 seconds before next article...")
-            time.sleep(10)
-    
-    # Update keyword files only for successfully processed keywords
-    update_keyword_files(successful_keywords, article_urls)
-    
-    # Send email notification with URLs
-    if generated_files:
-        send_email_notification(successful_keywords, article_urls)
-    
-    print(f"Article generation completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Generated {len(generated_files)} articles")
-    print(f"Successfully processed {len(successful_keywords)} keywords")
-    
-    for i, (keyword, url) in enumerate(zip(successful_keywords, article_urls), 1):
-        print(f"{i}. {keyword} → {url}")
+    try:
+        # Process all markdown files
+        process_all_markdown_files()
+        print(f"\n✅ Script completed successfully - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"📊 Summary: Processed {stats['total_files']} files, replaced {stats['successful_replacements']} images")
+        logger.info(f"Script completed successfully")
+        logger.info(f"Summary: Processed {stats['total_files']} files, replaced {stats['successful_replacements']} images")
+    except KeyboardInterrupt:
+        print("\n⚠️ Script interrupted by user. Exiting...")
+        logger.warning("Script interrupted by user")
+        # Create summary file even if interrupted
+        create_summary_file()
+    except Exception as e:
+        print(f"\n❌ Unexpected error in main execution: {e}")
+        logger.error(f"Unexpected error in main execution: {e}")
+        print("Script terminated with errors.")
+        # Create summary file even if errors occurred
+        create_summary_file()
 
 if __name__ == "__main__":
     main()
